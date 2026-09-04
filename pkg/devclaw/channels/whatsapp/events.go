@@ -468,6 +468,14 @@ func (w *WhatsApp) handleMessageEvt(evt *events.Message) {
 	// Extract message content by type.
 	w.extractMessageContent(evt.Message, msg)
 
+	// An unset type means the extractor found nothing deliverable: a protocol
+	// message, an empty container, or a type this build does not understand.
+	// Dropping it here keeps control chatter from reaching the agent, which
+	// used to answer it at the cost of a full prompt.
+	if msg.Type == "" {
+		return
+	}
+
 	// Handle quoted/reply messages.
 	w.extractQuotedMessage(evt.Message, msg)
 
@@ -483,10 +491,68 @@ func (w *WhatsApp) handleMessageEvt(evt *events.Message) {
 }
 
 // extractMessageContent extracts the text/media content from a WhatsApp message.
+// maxUnwrapDepth bounds the container recursion. Real nesting is one or two
+// levels (a view-once inside an ephemeral chat); the bound only exists so a
+// malformed or hostile message cannot spin the unwrapper.
+const maxUnwrapDepth = 5
+
+// unwrapMessage peels the container wrappers WhatsApp puts around real content
+// until it reaches the payload. Media sent in a disappearing chat, as
+// view-once, edited, or echoed from another of the user's own devices arrives
+// wrapped; without unwrapping, none of it ever reaches the branch for its own
+// type and it all collapses into the unknown-type fallback.
+//
+// The second return reports a control message (revoke, edit notification,
+// ephemeral setting, history sync). Those are protocol chatter, not something
+// a user said, and must never reach the agent.
+func unwrapMessage(waMsg *waE2E.Message, depth int) (inner *waE2E.Message, isControl bool) {
+	if waMsg == nil || depth >= maxUnwrapDepth {
+		return waMsg, false
+	}
+
+	// ProtocolMessage carries no user content of its own.
+	if waMsg.ProtocolMessage != nil {
+		return nil, true
+	}
+
+	// DeviceSentMessage is its own type; the rest are FutureProofMessage.
+	if dsm := waMsg.GetDeviceSentMessage(); dsm != nil {
+		return unwrapMessage(dsm.GetMessage(), depth+1)
+	}
+	for _, wrapped := range []*waE2E.FutureProofMessage{
+		waMsg.GetEphemeralMessage(),
+		waMsg.GetEditedMessage(),
+		waMsg.GetDocumentWithCaptionMessage(),
+		waMsg.GetViewOnceMessage(),
+		waMsg.GetViewOnceMessageV2(),
+		waMsg.GetViewOnceMessageV2Extension(),
+	} {
+		if wrapped != nil {
+			return unwrapMessage(wrapped.GetMessage(), depth+1)
+		}
+	}
+
+	return waMsg, false
+}
+
 func (w *WhatsApp) extractMessageContent(waMsg *waE2E.Message, msg *channels.IncomingMessage) {
 	if waMsg == nil {
 		return
 	}
+
+	// Reach the real payload before matching on type. msg.Type is left at its
+	// zero value when there is nothing to deliver, which is how the caller
+	// knows to drop the message instead of handing it to the agent.
+	unwrapped, isControl := unwrapMessage(waMsg, 0)
+	if isControl {
+		w.logger.Debug("whatsapp: dropping control message", "id", msg.ID, "from", msg.From)
+		return
+	}
+	if unwrapped == nil {
+		w.logger.Debug("whatsapp: dropping empty message container", "id", msg.ID, "from", msg.From)
+		return
+	}
+	waMsg = unwrapped
 
 	// Text message (simple conversation).
 	if waMsg.Conversation != nil {
@@ -673,9 +739,11 @@ func (w *WhatsApp) extractMessageContent(waMsg *waE2E.Message, msg *channels.Inc
 		return
 	}
 
-	// Fallback: unknown message type.
-	msg.Type = channels.MessageText
-	msg.Content = "[unsupported message type]"
+	// Fallback: still unknown after unwrapping. Leaving Type unset drops the
+	// message. Stamping it as text used to send the literal placeholder to the
+	// model as if the user had typed it, which cost a full prompt and produced
+	// an answer to something nobody said.
+	w.logger.Debug("whatsapp: dropping unrecognized message type", "id", msg.ID, "from", msg.From)
 }
 
 // extractQuotedMessage extracts reply/quoted context and mentions from a message.
@@ -728,6 +796,14 @@ func (w *WhatsApp) extractQuotedMessage(waMsg *waE2E.Message, msg *channels.Inco
 
 // extractQuotedText gets the text from a quoted message.
 func extractQuotedText(quoted *waE2E.Message) string {
+	// A quoted message can itself be wrapped — replying to a voice note in a
+	// disappearing chat is the common case.
+	if unwrapped, isControl := unwrapMessage(quoted, 0); !isControl && unwrapped != nil {
+		quoted = unwrapped
+	}
+	if quoted == nil {
+		return ""
+	}
 	if quoted.Conversation != nil {
 		return quoted.GetConversation()
 	}
