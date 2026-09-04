@@ -1,9 +1,12 @@
 package backends
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestOpenSQLite(t *testing.T) {
@@ -183,4 +186,80 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestMigrateAddsRetryCountToExistingDatabase reproduces the production
+// failure: a database created before subagent_runs.retry_count existed keeps
+// its old shape forever, because CREATE TABLE IF NOT EXISTS is a no-op against
+// an existing table. recoverOrphanedSubagents then fails on every sweep with
+// "no such column: retry_count" and crashed subagents are never recovered.
+func TestMigrateAddsRetryCountToExistingDatabase(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// The pre-migration shape of the table, without retry_count.
+	if _, err := db.Exec(`CREATE TABLE subagent_runs (
+		id                TEXT PRIMARY KEY,
+		label             TEXT NOT NULL,
+		task              TEXT NOT NULL,
+		status            TEXT NOT NULL DEFAULT 'running',
+		result            TEXT DEFAULT '',
+		error             TEXT DEFAULT '',
+		model             TEXT DEFAULT '',
+		parent_session_id TEXT DEFAULT '',
+		tokens_used       INTEGER DEFAULT 0,
+		started_at        TEXT NOT NULL,
+		completed_at      TEXT DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("seed legacy table: %v", err)
+	}
+
+	hasRetryCount := func() bool {
+		t.Helper()
+		rows, err := db.Query(`PRAGMA table_info(subagent_runs)`)
+		if err != nil {
+			t.Fatalf("table_info: %v", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var name, typ string
+			var notNull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if name == "retry_count" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if hasRetryCount() {
+		t.Fatal("legacy table already has retry_count; the fixture no longer reproduces the bug")
+	}
+
+	if err := NewSQLiteMigrator(db).Migrate(0); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if !hasRetryCount() {
+		t.Error("retry_count missing after migration")
+	}
+
+	// The query the subagent sweeper runs must now work.
+	if _, err := db.Exec(
+		`SELECT id, label, task, retry_count, parent_session_id FROM subagent_runs`,
+	); err != nil {
+		t.Errorf("sweeper query still fails: %v", err)
+	}
+
+	// Idempotent: a second run must not error on the duplicate column.
+	if err := NewSQLiteMigrator(db).Migrate(0); err != nil {
+		t.Errorf("second migrate: %v", err)
+	}
 }

@@ -1019,7 +1019,10 @@ type anthropicStreamEvent struct {
 		StopReason  string `json:"stop_reason,omitempty"`
 	} `json:"delta,omitempty"`
 	Usage *struct {
-		OutputTokens int `json:"output_tokens,omitempty"`
+		OutputTokens             int `json:"output_tokens,omitempty"`
+		InputTokens              int `json:"input_tokens,omitempty"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 	} `json:"usage,omitempty"`
 }
 
@@ -2340,6 +2343,19 @@ func (c *LLMClient) completeOnceStreamAnthropic(ctx context.Context, model strin
 			}
 			if event.Usage != nil {
 				usage.CompletionTokens = event.Usage.OutputTokens
+				// Anthropic reports input usage in message_start, but
+				// OpenAI-to-Anthropic proxies (Z.AI among them) send it only
+				// here. Without this the prompt side stays at zero and every
+				// cost estimate is short by the whole input.
+				if usage.PromptTokens == 0 && event.Usage.InputTokens > 0 {
+					usage.PromptTokens = event.Usage.InputTokens
+				}
+				if usage.CacheReadTokens == 0 && event.Usage.CacheReadInputTokens > 0 {
+					usage.CacheReadTokens = event.Usage.CacheReadInputTokens
+				}
+				if usage.CacheWriteTokens == 0 && event.Usage.CacheCreationInputTokens > 0 {
+					usage.CacheWriteTokens = event.Usage.CacheCreationInputTokens
+				}
 			}
 		}
 	}

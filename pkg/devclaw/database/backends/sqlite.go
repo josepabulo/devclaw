@@ -144,6 +144,21 @@ func (m *SQLiteMigrator) Migrate(target int) error {
 		tokenize = 'porter unicode61'
 	)`)
 
+	// Column migrations: add columns to tables that predate them, without
+	// dropping data. Each ALTER is best-effort because SQLite has no
+	// IF NOT EXISTS for ADD COLUMN and errors when the column already exists.
+	//
+	// These must live here and not only in copilot.OpenDatabase: this migrator
+	// is the path the running server actually takes, and CREATE TABLE IF NOT
+	// EXISTS is a no-op against a database created before the column existed.
+	columnMigrations := []string{
+		`ALTER TABLE jobs ADD COLUMN announce INTEGER DEFAULT 1`,
+		`ALTER TABLE subagent_runs ADD COLUMN retry_count INTEGER DEFAULT 0`,
+	}
+	for _, stmt := range columnMigrations {
+		_, _ = m.db.Exec(stmt) // ignore "duplicate column" on re-runs
+	}
+
 	// Record migration
 	if current == 0 {
 		_, err = m.db.Exec("INSERT INTO schema_version (version) VALUES (1)")

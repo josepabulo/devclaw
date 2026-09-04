@@ -1322,6 +1322,31 @@ func (t *Telegram) sendWithThreadFallback(method string, payload map[string]any)
 
 // ---------- API Helpers ----------
 
+// redactedError hides the bot token in an error's text while keeping the
+// original error reachable through errors.Is / errors.As.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redactToken strips the bot token from an error's message. Transport errors
+// from net/http arrive as *url.Error carrying the full request URL, and the
+// token sits in the Telegram API path — so a plain 502 or timeout would
+// otherwise write the credential straight into the logs.
+func (t *Telegram) redactToken(err error) error {
+	if err == nil || t.cfg.Token == "" {
+		return err
+	}
+	msg := strings.ReplaceAll(err.Error(), t.cfg.Token, "<redacted>")
+	if msg == err.Error() {
+		return err
+	}
+	return &redactedError{msg: msg, err: err}
+}
+
 // apiCall makes a POST request to the Telegram Bot API.
 // On API errors it returns a *TelegramAPIError with structured fields
 // for classification (retryable, auth, rate-limited, etc.).
@@ -1341,7 +1366,7 @@ func (t *Telegram) apiCall(method string, payload map[string]any) (json.RawMessa
 	start := time.Now()
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("telegram: %s request failed: %w", method, err)
+		return nil, fmt.Errorf("telegram: %s request failed: %w", method, t.redactToken(err))
 	}
 	defer resp.Body.Close()
 
@@ -1458,7 +1483,7 @@ func (t *Telegram) uploadFile(method string, chatID int64, threadID int64, field
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram: upload failed: %w", err)
+		return fmt.Errorf("telegram: upload failed: %w", t.redactToken(err))
 	}
 	defer resp.Body.Close()
 
