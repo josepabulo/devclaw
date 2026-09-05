@@ -2190,6 +2190,26 @@ func (c *LLMClient) completeOnceStreamAnthropic(ctx context.Context, model strin
 	// for a thinking block if thinking has already been ended.
 	thinkingActive := false
 
+	// thinkingTagOpen tracks whether a <thinking> wrapper is currently open on
+	// the stream. Reasoning has to reach onChunk wrapped, exactly like the
+	// OpenAI-compatible path does with reasoning_content: the block streamer
+	// strips tagged blocks before a channel sends them, and the web UI renders
+	// them as a collapsible block. Forwarding it bare delivered the model's
+	// chain of thought to WhatsApp as one message per thought.
+	thinkingTagOpen := false
+	openThinking := func() {
+		if !thinkingTagOpen && onChunk != nil {
+			thinkingTagOpen = true
+			onChunk("<thinking>")
+		}
+	}
+	closeThinking := func() {
+		if thinkingTagOpen && onChunk != nil {
+			thinkingTagOpen = false
+			onChunk("</thinking>")
+		}
+	}
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
@@ -2237,11 +2257,10 @@ func (c *LLMClient) completeOnceStreamAnthropic(ctx context.Context, model strin
 				thinkingActive = true
 			}
 
-		// Native thinking_delta event: contains partial thinking text.
-		// We forward it to the onChunk callback so that partial text streaming
-		// remains active even while the model is in reasoning mode.
+		// Native thinking_delta event: partial thinking text.
 		case "thinking_delta":
 			if event.Delta != nil && event.Delta.Thinking != "" {
+				openThinking()
 				if onChunk != nil {
 					onChunk(event.Delta.Thinking)
 				}
@@ -2283,16 +2302,17 @@ func (c *LLMClient) completeOnceStreamAnthropic(ctx context.Context, model strin
 			if event.Delta != nil {
 				switch event.Delta.Type {
 				case "text_delta":
+					closeThinking()
 					contentBuilder.WriteString(event.Delta.Text)
 					if onChunk != nil {
 						onChunk(event.Delta.Text)
 					}
 				case "thinking_delta":
-					// Forward thinking deltas to the stream callback so that partial
-					// text continues to flow to the UI even during reasoning. The
-					// text itself is not included in the final assistant response.
-					if event.Delta.Thinking != "" && onChunk != nil {
-						onChunk(event.Delta.Thinking)
+					if event.Delta.Thinking != "" {
+						openThinking()
+						if onChunk != nil {
+							onChunk(event.Delta.Thinking)
+						}
 					}
 				case "input_json_delta":
 					if b, ok := toolArgsAccum[blockIdx]; ok {
@@ -2330,6 +2350,10 @@ func (c *LLMClient) completeOnceStreamAnthropic(ctx context.Context, model strin
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("reading stream: %w", err)
 	}
+
+	// A stream that ends while still reasoning must not leave the wrapper open,
+	// or the unterminated block escapes the streamer's tagged-block filter.
+	closeThinking()
 
 	// Anthropic (and Z.AI proxy) may return context overflow as a stop_reason
 	// in a 200 OK response instead of an HTTP error. Convert to an error so
