@@ -431,7 +431,7 @@ type chatRequest struct {
 	ToolStream          *bool            `json:"tool_stream,omitempty"`           // Z.AI: real-time tool call streaming
 	Options             map[string]any   `json:"options,omitempty"`               // Ollama: runtime options (num_ctx, etc.)
 	ServiceTier         string           `json:"service_tier,omitempty"`          // OpenAI: "auto", "priority", "standard_only"
-	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`      // OpenAI o-series: "low", "medium", "high"
+	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`      // OpenAI reasoning models: none|low|medium|high|xhigh|max
 }
 
 // modelDefaults holds per-model/provider behavior overrides.
@@ -458,94 +458,12 @@ func getModelDefaults(model, provider string) modelDefaults {
 		SupportsTools:       true,
 	}
 
-	switch {
-	// ── OpenAI models ──
-	// gpt-5 family: temperature not reliably supported across all models.
-	case strings.HasPrefix(model, "gpt-5"):
-		d.SupportsTemperature = false
-		d.MaxOutputTokens = 16384
-		d.UsesMaxCompletionTokens = true
-	case strings.HasPrefix(model, "o1"), strings.HasPrefix(model, "o3"), strings.HasPrefix(model, "o4"):
-		d.SupportsTemperature = false // o-series only supports default (1.0)
-		d.MaxOutputTokens = 100000
-		d.UsesMaxCompletionTokens = true
-	case strings.HasPrefix(model, "gpt-4.1"):
-		d.SupportsTemperature = false
-		d.MaxOutputTokens = 16384
-		d.UsesMaxCompletionTokens = true
-	case strings.HasPrefix(model, "gpt-4o"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 16384
-	case strings.HasPrefix(model, "gpt-4.5"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 16384
-
-	// ── Anthropic models ──
-	case strings.HasPrefix(model, "claude-opus-4"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 16384
-	case strings.HasPrefix(model, "claude-sonnet-4-6"),
-		strings.HasPrefix(model, "claude-sonnet-4.6"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 16384
-	case strings.HasPrefix(model, "claude-sonnet-4"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 16384
-	case strings.HasPrefix(model, "claude-haiku"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 8192
-	case strings.HasPrefix(model, "claude-3"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 4096
-
-	// ── Google models ──
-	case strings.HasPrefix(model, "gemini-2.5"),
-		strings.HasPrefix(model, "gemini-3"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 8192
-	case strings.HasPrefix(model, "gemini-2"),
-		strings.HasPrefix(model, "gemini-1.5"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 8192
-
-	// ── GLM models (Z.AI) ──
-	case strings.HasPrefix(model, "glm-5.1"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 16384
-	case strings.HasPrefix(model, "glm-5-turbo"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 16384
-	case strings.HasPrefix(model, "glm-5"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 8192
-	case strings.HasPrefix(model, "glm-4"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 4096
-
-	// ── Google Gemini models ──
-	case strings.HasPrefix(model, "gemini-3"), strings.HasPrefix(model, "gemini-2.5-pro"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 8192
-	case strings.HasPrefix(model, "gemini-2"), strings.HasPrefix(model, "gemini-1.5"):
-		d.DefaultTemperature = 1.0
-		d.MaxOutputTokens = 8192
-
-	// ── xAI (Grok) models ──
-	case strings.HasPrefix(model, "grok"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 16384
-
-	// ── Ollama / local models ──
-	case strings.HasPrefix(model, "llama"),
-		strings.HasPrefix(model, "mistral"),
-		strings.HasPrefix(model, "qwen"),
-		strings.HasPrefix(model, "gemma"),
-		strings.HasPrefix(model, "phi"),
-		strings.HasPrefix(model, "deepseek"),
-		strings.HasPrefix(model, "codellama"),
-		strings.HasPrefix(model, "command-r"):
-		d.DefaultTemperature = 0.7
-		d.MaxOutputTokens = 4096
+	if spec, ok := LookupModel(model); ok {
+		d.SupportsTemperature = spec.SupportsTemperature
+		d.DefaultTemperature = spec.DefaultTemperature
+		d.MaxOutputTokens = spec.MaxOutput
+		d.UsesMaxCompletionTokens = spec.UsesMaxCompletionTokens
+		d.SupportsTools = spec.SupportsTools
 	}
 
 	// Provider-level overrides.
@@ -586,6 +504,11 @@ func (c *LLMClient) applyModelDefaults(req *chatRequest) {
 	// Strip tools if the model doesn't support them.
 	if !d.SupportsTools {
 		req.Tools = nil
+	}
+
+	// A configured effort wins over the fast-mode default.
+	if effort := c.paramString("reasoning_effort"); effort != "" {
+		req.ReasoningEffort = c.reasoningEffortFor(req.Model, effort)
 	}
 
 	// Ollama: inject num_ctx to ensure the model uses the correct context window.
@@ -633,6 +556,40 @@ func (c *LLMClient) applyModelDefaults(req *chatRequest) {
 	}
 }
 
+// reasoningEffortFor validates an effort level against what the model accepts.
+// Only models that declare EffortLevels are checked: for everything else the
+// caller's value is passed through, preserving the previous behaviour.
+func (c *LLMClient) reasoningEffortFor(model, want string) string {
+	if want == "" {
+		return ""
+	}
+
+	spec, ok := LookupModel(model)
+	if !ok {
+		return want
+	}
+	if !spec.AcceptsReasoningEffort {
+		if c.logger != nil {
+			c.logger.Warn("model does not take reasoning_effort, omitting", "model", model, "effort", want)
+		}
+		return ""
+	}
+	if len(spec.EffortLevels) == 0 {
+		return want
+	}
+	for _, lvl := range spec.EffortLevels {
+		if lvl == want {
+			return want
+		}
+	}
+
+	if c.logger != nil {
+		c.logger.Warn("reasoning_effort not supported by model, omitting",
+			"model", model, "effort", want, "supported", spec.EffortLevels)
+	}
+	return ""
+}
+
 // applyFastMode sets fast-mode fields on an OpenAI chatRequest when fast mode
 // is enabled in the context. Anthropic fast mode is handled directly on the
 // anthropicRequest.ServiceTier field at the callsite.
@@ -645,7 +602,29 @@ func (c *LLMClient) applyFastMode(ctx context.Context, req *chatRequest) {
 		return
 	}
 	req.ServiceTier = "priority"
-	req.ReasoningEffort = "low"
+	if req.ReasoningEffort == "" {
+		req.ReasoningEffort = c.fastModeEffort(req.Model)
+	}
+}
+
+// fastModeEffort picks the cheapest effort the model actually offers. Asking
+// for "low" unconditionally made fast mode a silent no-op on models whose
+// lowest level is higher, leaving the user on premium pricing with no latency
+// gain.
+func (c *LLMClient) fastModeEffort(model string) string {
+	spec, ok := LookupModel(model)
+	if !ok {
+		return "low"
+	}
+	for _, lvl := range spec.EffortLevels {
+		if lvl == "low" {
+			return "low"
+		}
+	}
+	if len(spec.EffortLevels) > 0 {
+		return spec.EffortLevels[0]
+	}
+	return c.reasoningEffortFor(model, "low")
 }
 
 // supportsCacheControl returns true if the provider supports prompt caching
@@ -693,10 +672,13 @@ func (c *LLMClient) setAnthropicBetaHeaders(req *http.Request, model string) {
 	}
 }
 
-// isAnthropic1MModel returns true if the model supports the 1M context beta.
+// isAnthropic1MModel returns true if the model reaches 1M through the opt-in
+// beta header. Reading BetaContextWindow keeps this from drifting away from the
+// window the registry reports, and resolves gateway-prefixed names that the
+// previous raw HasPrefix never matched.
 func isAnthropic1MModel(model string) bool {
-	return strings.HasPrefix(model, "claude-opus-4") ||
-		strings.HasPrefix(model, "claude-sonnet-4")
+	spec, ok := LookupModel(model)
+	return ok && spec.BetaContextWindow > 0
 }
 
 // paramBool reads a boolean parameter from the provider params map.
@@ -1797,18 +1779,28 @@ func (c *LLMClient) completeOnce(ctx context.Context, model string, messages []c
 	return c.completeOnceOpenAI(ctx, model, messages, tools)
 }
 
-// completeOnceAnthropic performs a single request using the Anthropic Messages API.
-func (c *LLMClient) completeOnceAnthropic(ctx context.Context, model string, messages []chatMessage, tools []ToolDefinition) (*LLMResponse, error) {
-	defaults := getModelDefaults(model, c.provider)
+// anthropicSamplingFor returns the temperature pointer and output cap for an
+// Anthropic request. Claude 4.7 and later reject temperature/top_p/top_k with a
+// 400, so temp is nil there and the field is omitted from the payload.
+func anthropicSamplingFor(model, provider string) (*float64, int) {
+	d := getModelDefaults(model, provider)
+
 	var temp *float64
-	if defaults.SupportsTemperature && defaults.DefaultTemperature > 0 {
-		t := defaults.DefaultTemperature
+	if d.SupportsTemperature && d.DefaultTemperature > 0 {
+		t := d.DefaultTemperature
 		temp = &t
 	}
-	maxTok := defaults.MaxOutputTokens
+
+	maxTok := d.MaxOutputTokens
 	if maxTok == 0 {
 		maxTok = 8192
 	}
+	return temp, maxTok
+}
+
+// completeOnceAnthropic performs a single request using the Anthropic Messages API.
+func (c *LLMClient) completeOnceAnthropic(ctx context.Context, model string, messages []chatMessage, tools []ToolDefinition) (*LLMResponse, error) {
+	temp, maxTok := anthropicSamplingFor(model, c.provider)
 
 	reqBody := convertToAnthropicRequest(model, messages, tools, temp, &maxTok)
 	if fastModeFromCtx(ctx) {
@@ -2140,16 +2132,7 @@ func (c *LLMClient) completeOnceStream(ctx context.Context, model string, messag
 
 // completeOnceStreamAnthropic handles Anthropic streaming with event types.
 func (c *LLMClient) completeOnceStreamAnthropic(ctx context.Context, model string, messages []chatMessage, tools []ToolDefinition, onChunk StreamCallback) (*LLMResponse, error) {
-	defaults := getModelDefaults(model, c.provider)
-	var temp *float64
-	if defaults.SupportsTemperature && defaults.DefaultTemperature > 0 {
-		t := defaults.DefaultTemperature
-		temp = &t
-	}
-	maxTok := defaults.MaxOutputTokens
-	if maxTok == 0 {
-		maxTok = 8192
-	}
+	temp, maxTok := anthropicSamplingFor(model, c.provider)
 
 	reqBody := convertToAnthropicRequest(model, messages, tools, temp, &maxTok)
 	reqBody.Stream = true
