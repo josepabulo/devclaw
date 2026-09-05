@@ -1729,6 +1729,10 @@ func detectProcessManager() string {
 // charsPerToken returns the estimated chars-per-token ratio for a given model.
 // Falls back to 4.0 (conservative default) when the model is unknown.
 func charsPerToken(model string) float64 {
+	if spec, ok := LookupModel(model); ok && spec.CharsPerToken > 0 {
+		return spec.CharsPerToken
+	}
+
 	lower := strings.ToLower(model)
 	switch {
 	// Anthropic Claude models: ~3.5 chars/token on average.

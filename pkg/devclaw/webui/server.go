@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -437,6 +438,10 @@ type Config struct {
 
 	// TLS configures HTTPS for the WebUI.
 	TLS TLSConfig `yaml:"tls"`
+
+	// CORSOrigins lists extra origins allowed to call the API with credentials.
+	// Loopback origins are always allowed so the Vite dev server keeps working.
+	CORSOrigins []string `yaml:"cors_origins"`
 }
 
 // UpdateChecker is the interface used by the web UI to query update status.
@@ -718,7 +723,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.server = &http.Server{
 		Addr:         s.cfg.Address,
-		Handler:      corsMiddleware(mux),
+		Handler:      corsMiddleware(mux, s.cfg.CORSOrigins),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 0, // Disabled for SSE streams (long-lived connections)
 		IdleTimeout:  120 * time.Second,
@@ -816,15 +821,18 @@ func (s *Server) requireAssistant(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// corsMiddleware adds CORS headers for development (Vite dev server on :3000).
-func corsMiddleware(next http.Handler) http.Handler {
+// corsMiddleware adds CORS headers for allowed origins only. Reflecting any
+// Origin back with Allow-Credentials lets any site the user visits call this
+// API with their cookie. Loopback stays allowed so `make dev` keeps working.
+func corsMiddleware(next http.Handler, allowed []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" {
+		if origin != "" && originAllowed(origin, allowed) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -832,6 +840,22 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// originAllowed reports whether an Origin may receive credentialed CORS
+// headers: loopback always, plus anything the operator configured.
+func originAllowed(origin string, allowed []string) bool {
+	for _, o := range allowed {
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // ── JSON helpers ──

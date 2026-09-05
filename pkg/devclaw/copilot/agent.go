@@ -2608,11 +2608,16 @@ func (a *AgentRun) getModelContextWindow() int {
 
 // getModelContextWindowByName returns the context window size for a given model name.
 func getModelContextWindowByName(modelName string) int {
+	if spec, ok := LookupModel(modelName); ok {
+		return spec.ContextWindow
+	}
+
 	model := strings.ToLower(modelName)
 	if model == "" {
 		model = "default"
 	}
 
+	// Family heuristics for custom or fine-tuned names the registry cannot know.
 	switch {
 	case strings.Contains(model, "gpt-4o") || strings.Contains(model, "gpt-5"):
 		return 128000

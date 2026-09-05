@@ -318,6 +318,12 @@ func (s *Server) handleChatStreamUnified(w http.ResponseWriter, r *http.Request,
 
 		case event, ok := <-handle.Events:
 			if !ok {
+				// The producer can close the channel without a terminal event
+				// (e.g. the run context was already cancelled). Without a final
+				// frame the client just sees the body end and waits forever.
+				writeSSE(w, flusher, "done", map[string]any{
+					"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
+				})
 				handle.Cancel()
 				s.unregisterRun(handle.RunID)
 				return

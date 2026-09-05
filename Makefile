@@ -94,11 +94,11 @@ chat: build-go
 
 ## test: Run all unit tests
 test:
-	CGO_ENABLED=1 go test -tags 'sqlite_fts5' -count=1 -race ./pkg/devclaw/copilot/ ./pkg/devclaw/copilot/security/ ./pkg/devclaw/skills/
+	CGO_ENABLED=1 go test -tags 'sqlite_fts5' -count=1 -race ./pkg/devclaw/copilot/ ./pkg/devclaw/copilot/security/ ./pkg/devclaw/skills/ ./pkg/devclaw/webui/ ./pkg/devclaw/gateway/ ./pkg/devclaw/channels/whatsapp/
 
 ## test-v: Run all unit tests (verbose)
 test-v:
-	CGO_ENABLED=1 go test -tags 'sqlite_fts5' -count=1 -race -v ./pkg/devclaw/copilot/ ./pkg/devclaw/copilot/security/ ./pkg/devclaw/skills/
+	CGO_ENABLED=1 go test -tags 'sqlite_fts5' -count=1 -race -v ./pkg/devclaw/copilot/ ./pkg/devclaw/copilot/security/ ./pkg/devclaw/skills/ ./pkg/devclaw/webui/ ./pkg/devclaw/gateway/ ./pkg/devclaw/channels/whatsapp/
 
 ## lint: Run linter
 lint:

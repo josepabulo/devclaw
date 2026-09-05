@@ -33,29 +33,9 @@ type UsageTracker struct {
 	sessions   map[string]*SessionUsage
 	global     *SessionUsage
 	modelCosts map[string]ModelCost
+	costsOnce  sync.Once
 
 	logger *slog.Logger
-}
-
-var defaultModelCosts = map[string]ModelCost{
-	// OpenAI
-	"gpt-4o":          {InputPer1M: 2.50, OutputPer1M: 10.00},
-	"gpt-4o-mini":     {InputPer1M: 0.15, OutputPer1M: 0.60},
-	"gpt-4.5-preview": {InputPer1M: 75.00, OutputPer1M: 150.00},
-	"gpt-5":           {InputPer1M: 2.00, OutputPer1M: 8.00},
-	"gpt-5-mini":      {InputPer1M: 0.15, OutputPer1M: 0.60},
-	// Anthropic
-	"claude-opus-4.6":   {InputPer1M: 5.00, OutputPer1M: 25.00},
-	"claude-opus-4.5":   {InputPer1M: 5.00, OutputPer1M: 25.00},
-	"claude-sonnet-4.5": {InputPer1M: 3.00, OutputPer1M: 15.00},
-	"claude-3.5-sonnet": {InputPer1M: 3.00, OutputPer1M: 15.00},
-	// GLM (Z.AI)
-	"glm-5":           {InputPer1M: 1.00, OutputPer1M: 3.20},
-	"glm-5-turbo":     {InputPer1M: 0.80, OutputPer1M: 2.50},
-	"glm-5-code":      {InputPer1M: 1.20, OutputPer1M: 5.00},
-	"glm-4.7":         {InputPer1M: 0.50, OutputPer1M: 1.50},
-	"glm-4.7-flash":   {InputPer1M: 0.10, OutputPer1M: 0.40},
-	"glm-4.7-flashx":  {InputPer1M: 0.10, OutputPer1M: 0.40},
 }
 
 // NewUsageTracker creates a new UsageTracker.
@@ -85,13 +65,19 @@ func (u *UsageTracker) init() {
 	}
 }
 
-// initModelCosts copies default costs if not already set.
+// initModelCosts seeds prices from the model registry, leaving any cost the
+// user configured untouched.
 func (u *UsageTracker) initModelCosts() {
-	for model, cost := range defaultModelCosts {
-		if _, ok := u.modelCosts[model]; !ok {
-			u.modelCosts[model] = cost
+	u.costsOnce.Do(func() {
+		for _, spec := range modelRegistry {
+			if spec.InputPer1M == 0 && spec.OutputPer1M == 0 {
+				continue
+			}
+			if _, ok := u.modelCosts[spec.Canonical]; !ok {
+				u.modelCosts[spec.Canonical] = ModelCost{InputPer1M: spec.InputPer1M, OutputPer1M: spec.OutputPer1M}
+			}
 		}
-	}
+	})
 }
 
 // Record adds usage for a session and globally.
@@ -133,13 +119,13 @@ func (u *UsageTracker) Record(sessionID, model string, usage LLMUsage) {
 func (u *UsageTracker) estimateCost(model string, prompt, completion int) float64 {
 	cost, ok := u.modelCosts[model]
 	if !ok {
-		// Try prefix match for model variants (e.g. gpt-4o-2024-04-09)
-		for k, v := range u.modelCosts {
-			if len(model) >= len(k) && model[:len(k)] == k {
-				cost = v
-				ok = true
-				break
-			}
+		// Registry resolution handles variants, gateway prefixes and dotted
+		// spellings with a deterministic longest-prefix match. The old loop
+		// walked the map, so "gpt-5-mini" could pick up "gpt-5" pricing
+		// depending on iteration order.
+		if in, out, found := LookupModelPrice(model); found {
+			cost = ModelCost{InputPer1M: in, OutputPer1M: out}
+			ok = true
 		}
 	}
 	if !ok {

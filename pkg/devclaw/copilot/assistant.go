@@ -5014,7 +5014,13 @@ func (a *Assistant) resumeInterruptedRuns() {
 				response = RedactCredentials(sanitizeOutput(response))
 				formatted := FormatForChannel(response, run.Channel)
 				outMsg := &channels.OutgoingMessage{Content: formatted}
-				_ = a.channelMgr.Send(a.ctx, run.Channel, run.ChatID, outMsg)
+				if err := a.channelMgr.Send(a.ctx, run.Channel, run.ChatID, outMsg); err != nil {
+					// Runs resume ~2s after boot, while channels may still be
+					// reconnecting. The history entry below marks this as
+					// delivered, so a silent drop loses the answer for good.
+					a.logger.Error("failed to deliver resumed run response",
+						"channel", run.Channel, "chat_id", run.ChatID, "error", err)
+				}
 			}
 
 			// Save to session history.

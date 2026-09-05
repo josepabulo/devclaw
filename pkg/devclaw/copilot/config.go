@@ -543,7 +543,10 @@ func (m MediaConfig) Effective() MediaConfig {
 // provider so users don't have to configure transcription separately when
 // their provider already supports it.
 func (m *MediaConfig) ResolveForProvider(provider, baseURL string) {
-	if m.TranscriptionBaseURL != "" {
+	// Bail out when the endpoint is already pinned, and equally when a
+	// dedicated key is set: deriving an endpoint from the main provider would
+	// then send that key to a host it does not belong to.
+	if m.TranscriptionBaseURL != "" || m.TranscriptionAPIKey != "" {
 		return
 	}
 	switch {

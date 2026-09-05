@@ -132,9 +132,13 @@ func extractToken(r *http.Request) string {
 		return strings.TrimPrefix(auth, "Bearer ")
 	}
 
-	// Query parameter (for SSE connections).
-	if t := r.URL.Query().Get("token"); t != "" {
-		return t
+	// Query parameter, accepted only for EventSource streams: the browser API
+	// cannot set headers, so it has no alternative. Everywhere else a token in
+	// the URL just leaks into access logs and Referer headers.
+	if isEventStreamRequest(r) {
+		if t := r.URL.Query().Get("token"); t != "" {
+			return t
+		}
 	}
 
 	// HttpOnly cookie.
@@ -143,4 +147,11 @@ func extractToken(r *http.Request) string {
 	}
 
 	return ""
+}
+
+// isEventStreamRequest reports whether the client is opening an SSE stream.
+// EventSource always sends this Accept header; fetch-based callers send the
+// token as a Bearer header instead.
+func isEventStreamRequest(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
