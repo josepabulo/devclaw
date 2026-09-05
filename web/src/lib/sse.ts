@@ -154,6 +154,10 @@ export function createPOSTSSEConnection(options: POSTSSEOptions): () => void {
 
       const decoder = new TextDecoder();
       let buffer = '';
+      // A stream can end without a terminal frame (server cancelled the run,
+      // connection dropped mid-flight). Consumers only clear their streaming
+      // state on done/error, so without this the UI spins forever.
+      let sawTerminal = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -179,6 +183,7 @@ export function createPOSTSSEConnection(options: POSTSSEOptions): () => void {
           }
 
           if (eventData) {
+            if (eventType === 'done' || eventType === 'error') sawTerminal = true;
             try {
               onEvent({ type: eventType, data: JSON.parse(eventData) });
             } catch {
@@ -186,6 +191,13 @@ export function createPOSTSSEConnection(options: POSTSSEOptions): () => void {
             }
           }
         }
+      }
+
+      if (!sawTerminal) {
+        onEvent({
+          type: 'done',
+          data: { usage: { input_tokens: 0, output_tokens: 0 } },
+        });
       }
     })
     .catch((err) => {
