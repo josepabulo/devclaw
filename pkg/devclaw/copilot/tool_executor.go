@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -1317,12 +1318,32 @@ func (e *ToolExecutor) executeConcurrentGroup(ctx context.Context, calls []ToolC
 
 // executeSingle runs a single tool call and returns the result.
 // If a ToolGuard is configured, it checks permissions before executing.
-func (e *ToolExecutor) executeSingle(ctx context.Context, call ToolCall) ToolResult {
+func (e *ToolExecutor) executeSingle(ctx context.Context, call ToolCall) (result ToolResult) {
 	name := call.Function.Name
-	result := ToolResult{
+	result = ToolResult{
 		ToolCallID: call.ID,
 		Name:       name,
 	}
+
+	// A panic in any of the registered tools — or in a plugin's native handler —
+	// would otherwise take the whole daemon down: every channel and every
+	// in-flight run with it. Turn it into a failed tool call instead.
+	// This also covers the concurrent group, whose goroutines call through here.
+	defer func() {
+		if r := recover(); r != nil {
+			e.logger.Error("tool panicked",
+				"tool", name,
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			result = ToolResult{
+				ToolCallID: call.ID,
+				Name:       name,
+				Content:    fmt.Sprintf("[Tool %q panicked and was isolated]", name),
+				Error:      fmt.Errorf("tool %q panicked: %v", name, r),
+			}
+		}
+	}()
 
 	e.mu.RLock()
 	tool, ok := e.tools[name]
