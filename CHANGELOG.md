@@ -2,6 +2,156 @@
 
 All notable changes to DevClaw are documented in this file.
 
+## [v1.24.0] — 2026-09-04 — Model registry, panic isolation, WhatsApp audio
+
+### Fixed
+
+- **A panic in any tool took the whole daemon down.** `recover()` guarded the
+  scheduler, hooks, dream and the WhatsApp channel, but not the path that
+  actually runs tools: `tool_executor.go`, `agent.go` and `assistant.go` had
+  none. A nil dereference in any registered tool — or in a plugin's native
+  handler — unwound past the executor and killed the process, dropping every
+  channel and every in-flight run with it. `executeSingle` now turns a panic
+  into a failed tool call, which also covers the concurrent group since its
+  goroutines call through it.
+- **The web chat hung forever when a stream ended without a terminal event.**
+  The handler returned as soon as the event channel closed, so the HTTP body
+  just stopped; the client clears its streaming state only on `done`/`error`,
+  leaving a permanent spinner with Send stuck as Stop. The server now always
+  emits a final frame, and the client synthesises one if a stream ends without
+  it — a dropped connection produced the same hang.
+- **The answer to a resumed run could vanish silently.** `assistant.go` was the
+  one place sending a final response without checking the error, and it runs
+  about two seconds after boot, while channels are still reconnecting. The
+  history entry immediately after marks the message as delivered and the
+  interrupted-run record has already been cleared, so a failed send lost the
+  answer for good, with nothing in the log.
+- **The model's reasoning was delivered to users as chat messages.** On the
+  Anthropic Messages API path, `thinking_delta` events were forwarded straight
+  to the stream callback — deliberately, to keep a UI busy during reasoning. But
+  that callback is what channels turn into messages, so on WhatsApp every
+  thought arrived as its own message, in whatever language the model reasons in.
+  Nothing downstream could stop it: the block streamer filters *tagged* blocks
+  and a `thinking_delta` carries no tags, while the channel-side check only
+  matches text starting with `Reasoning:` or a thinking tag. The leak became
+  constant with models that cannot switch reasoning off (GLM-5.3). Reasoning is
+  now wrapped in `<thinking>` before it reaches the callback, matching what the
+  OpenAI-compatible path already did with `reasoning_content`, so the existing
+  filters remove it for channels and the web UI can still render it. The wrapper
+  is closed when real text starts and again at end of stream, so a truncated
+  stream cannot leave an unterminated block that escapes the filter.
+- **Audio from WhatsApp was never transcribed.** A key stored in the encrypted
+  vault, the way this project requires, could not reach transcription: the vault
+  exports every entry as an environment variable, but nothing carried one onto
+  `media.transcription_api_key`, and the vault-to-config step only maps the key
+  belonging to the *current* provider. Transcription therefore fell back to the
+  main API key and, on a config carrying a leftover `transcription_base_url`,
+  sent it to a different vendor's endpoint. `ResolveSecrets` now resolves that
+  field like it already did for channel tokens, and `ResolveForProvider` no
+  longer derives an endpoint when a dedicated key is set — pointing one
+  vendor's key at another vendor's host is never right.
+
+### Changed
+
+- **The test suite and CI now cover the WebUI, gateway and WhatsApp packages.**
+  `make test` and the CI job each ran a hand-written package list, the two lists
+  had drifted apart, and both left out `pkg/devclaw/webui`, `pkg/devclaw/gateway`
+  and `pkg/devclaw/channels/whatsapp` — the last of which already had four test
+  files that never ran anywhere. All three pass today, so this is pure coverage:
+  the security tests added above would otherwise never have run in CI.
+
+### Security
+
+- **CORS reflected any Origin back with credentials**, on every build, across
+  the whole mux. Any site the user visited could call the API with their cookie.
+  Loopback stays allowed so the dev server keeps working; anything else must be
+  listed in `webui.cors_origins`.
+- **`?token=` was accepted on every route**, not just the SSE streams that need
+  it, leaking the token into access logs and `Referer` headers. It is now
+  honoured only for `text/event-stream` requests, which is the one case where
+  the browser cannot send a header instead.
+
+### Fixed (model registry)
+
+- **A model name with a gateway prefix matched nothing.** `getModelDefaults` and
+  `getModelContextWindowByName` matched the raw name with `HasPrefix`/`Contains`,
+  and nothing normalised it first. A config of `gatorllm/gpt-5.4` — or any
+  OpenRouter-style `anthropic/claude-...` — missed every case and fell through to
+  the OpenAI-compatible default, sending `temperature: 0.7` and `max_tokens` to a
+  reasoning model that accepts neither. Names now resolve through the registry:
+  exact match, then the segment after the last `/`, then longest prefix. The
+  suffix step runs after the exact match, so Ollama tags (`llama3:8b`) and
+  HuggingFace repos (`org/repo`) are unaffected.
+- **Anthropic requests failed outright on Claude 4.7 and later.** Every `claude-*`
+  entry declared `DefaultTemperature: 1.0`, and both Anthropic call sites sent it
+  whenever it was set. Sampling parameters were removed from Claude 4.7 on and
+  return a 400, so `claude-opus-5` failed on every request. Those models now omit
+  the field; 4.6, Haiku 4.5 and older keep sending it. (`anthropicSamplingFor`
+  replaces the block that was duplicated across the streaming and non-streaming
+  paths.)
+- **A folded key could swallow a longer number.** `gpt-4.1` folds to the key
+  `gpt-4-1`, which is a genuine prefix of the real id `gpt-4-1106-preview`. That
+  model would have started receiving `max_completion_tokens` and no temperature —
+  parameters it rejects. Prefix matching now requires a segment boundary: a key
+  ending in a digit never matches a longer digit run.
+- **A model without a published price reported zero cost.** Because resolution
+  returns the longest match, the new `gpt-5.6` and the existing `glm-5.1` — both
+  without their own price — shadowed the priced family prefix and silently billed
+  $0. Pricing now walks on to the nearest priced ancestor.
+- **The 1M beta header and the reported window could disagree.**
+  `isAnthropic1MModel` still matched raw names with `HasPrefix`, so it never fired
+  for gateway-prefixed ids and had no idea what the registry reported. It now
+  reads `BetaContextWindow` from the same table.
+- **Fast mode was a silent no-op on models with no `low` effort.** It asked for
+  `low` unconditionally; on GPT-6 Astra, whose lowest level is `medium`, the field
+  was dropped while `service_tier: priority` stayed set — premium pricing, no
+  latency gain. It now picks the cheapest level the model actually offers, and
+  omits the parameter entirely on models that do not accept it at all.
+- **Cost estimates were order-dependent.** The prefix fallback in `estimateCost`
+  iterated a map, so `gpt-5-mini` could be billed at `gpt-5` rates depending on
+  iteration order. Resolution is now a deterministic longest-prefix match.
+
+### Added
+
+- **GPT-6 Astra** (`gpt-6-astra`) — 1,050,000 token context, reasoning effort
+  `medium`/`high`/`xhigh`/`max`.
+- **GPT-5.6 family** (`gpt-5.6` and the `-sol`/`-terra`/`-luna` variants) —
+  1,050,000 token context, effort `none` through `max`.
+- **Claude 5 family** — `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`,
+  `claude-fable-5-1` at a 1M context window, plus `claude-opus-4-7`,
+  `claude-opus-4-8` and `claude-haiku-4-5`.
+- **GLM 5.2, 5.3 and 5.3-flash** — 1M context. GLM-5.3 runs with reasoning
+  always on and accepts `low`/`high`/`max` effort, which the registry now
+  declares so an unsupported level is never sent.
+- `params.reasoning_effort` is configurable and takes precedence over the
+  fast-mode default. A level the model does not accept is dropped with a warning
+  instead of being sent.
+
+### Changed
+
+- **Per-model behaviour now lives in one table** (`copilot/models.go`). Context
+  window, output cap, sampling support, tokenizer ratio and pricing were spread
+  across four functions with three different naming conventions (`claude-opus-4-6`
+  in one, `claude-opus-4.6` in another), which is how the drift accumulated.
+  `getModelDefaults`, `getModelContextWindowByName`, `charsPerToken` and the usage
+  tracker are now thin wrappers over `LookupModel`, each keeping a family
+  heuristic for custom and fine-tuned names the table cannot know about.
+- `claude-haiku-4-5` reports its real 200k context window instead of falling
+  through to the 128k default.
+
+### Notes
+
+- The 1M window is applied only to the Claude 5 family, where it is ungated. On
+  the 4.x family it stays at 200k because this codebase reaches 1M there through
+  the opt-in `context-1m-2025-08-07` beta header (`isAnthropic1MModel`), and
+  under-reporting the window only costs an early compaction while over-reporting
+  would fail the request.
+- `MaxOutput` stays at the values DevClaw already requested rather than each
+  model's 128k ceiling: that ceiling needs the streaming path to avoid HTTP
+  timeouts. Raising it is a follow-up.
+- Anthropic fast mode (`speed: "fast"` + the `fast-mode-2026-02-01` beta) is
+  deliberately not included — it carries premium pricing and is tracked separately.
+
 ## [v1.23.2] — 2026-06-22 — Scheduled routines run as real tasks
 
 ### Fixed
