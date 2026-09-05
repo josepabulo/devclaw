@@ -553,6 +553,17 @@ func ResolveSecrets(cfg *Config) {
 	resolveChannelToken(&cfg.Channels.Discord.Token, "DISCORD_BOT_TOKEN")
 	resolveChannelToken(&cfg.Channels.Slack.BotToken, "SLACK_BOT_TOKEN")
 	resolveChannelToken(&cfg.Channels.Slack.AppToken, "SLACK_APP_TOKEN")
+
+	// Transcription key: same second-pass problem as the channel tokens above.
+	// The vault exports every entry as an env var, but nothing mapped one onto
+	// media.transcription_api_key, so a key stored the way CLAUDE.md requires
+	// never reached the transcription path.
+	resolveChannelToken(&cfg.Media.TranscriptionAPIKey, "DEVCLAW_TRANSCRIPTION_API_KEY")
+	if cfg.Media.TranscriptionAPIKey == "" || IsEnvReference(cfg.Media.TranscriptionAPIKey) {
+		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			cfg.Media.TranscriptionAPIKey = key
+		}
+	}
 }
 
 // resolveChannelToken resolves a single channel token from an env var
