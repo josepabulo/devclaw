@@ -305,7 +305,7 @@ func (m *MemoryIndexer) indexAll() {
 		}
 	}
 	if legacyImported {
-		m.logger.Info("memory index: legacy .md indexing disabled post-migration (MEMORY.md + daily files now live in SQLite)")
+		m.logger.Debug("memory index: legacy .md indexing disabled post-migration (MEMORY.md + daily files now live in SQLite)")
 	}
 
 	// Track which files we've seen
@@ -395,7 +395,13 @@ func (m *MemoryIndexer) indexAll() {
 	m.mu.Unlock()
 
 	duration := time.Since(start)
-	m.logger.Info("memory index complete",
+	// A sweep that found nothing is the steady state on a migrated install and
+	// runs every few minutes; logging it at Info buried the runs that did work.
+	level := slog.LevelInfo
+	if indexed == 0 && deleted == 0 && errors == 0 {
+		level = slog.LevelDebug
+	}
+	m.logger.Log(context.Background(), level, "memory index complete",
 		"indexed", indexed,
 		"deleted", deleted,
 		"errors", errors,

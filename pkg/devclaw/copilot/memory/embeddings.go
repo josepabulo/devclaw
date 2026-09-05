@@ -289,7 +289,22 @@ func newEmbeddingProviderByName(name string, cfg EmbeddingConfig) EmbeddingProvi
 			return &NullEmbedder{}
 		}
 		return emb
+	case "openrouter":
+		// OpenRouter exposes an OpenAI-compatible /embeddings endpoint, so the
+		// OpenAI embedder works verbatim once the base URL points at it.
+		if cfg.BaseURL == "" {
+			cfg.BaseURL = "https://openrouter.ai/api/v1"
+		}
+		return NewOpenAIEmbedder(cfg)
+	case "disabled", "off":
+		// The honest way to turn embeddings off. "none" cannot serve this role:
+		// it has always been an alias for "auto", and installations that set it
+		// are relying on the ONNX embedder auto has been giving them.
+		return &NullEmbedder{}
 	case "auto", "none", "":
+		if strings.EqualFold(name, "none") {
+			slog.Warn("embedding.provider 'none' behaves as 'auto' and still loads a local model; use 'disabled' to actually turn embeddings off")
+		}
 		return newAutoEmbedder(cfg)
 	default:
 		return &NullEmbedder{}
@@ -302,6 +317,7 @@ var autoProviderOrder = []struct {
 	envVar string
 }{
 	{"openai", "OPENAI_API_KEY"},
+	{"openrouter", "OPENROUTER_API_KEY"},
 	{"gemini", "GOOGLE_API_KEY"},
 	{"voyage", "VOYAGE_API_KEY"},
 	{"mistral", "MISTRAL_API_KEY"},
